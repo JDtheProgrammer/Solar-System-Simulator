@@ -1,0 +1,216 @@
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <random>
+#include <vector>
+#include <omp.h>
+
+#ifdef USE_AVX
+#include <immintrin.h> // AVX: four double-precision values per vector
+#endif
+
+namespace {
+constexpr double G = 6.674e-11;
+constexpr double SUN_MASS = 1.9885e30;
+constexpr double AU = 1.496e11;
+
+double random_unit(std::mt19937& rng) {
+    return std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+}
+
+double random_log(std::mt19937& rng, double lo, double hi) {
+    return lo * std::pow(hi / lo, random_unit(rng));
+}
+
+double circular_speed(double central_mass, double r) {
+    return std::sqrt(G * central_mass / r);
+}
+}
+
+class System {
+private:
+    int n;
+    // Structure of Arrays (SoA): each coordinate is contiguous in memory,
+    // which makes vector loads straightforward and cache-friendly.
+    std::vector<double> x, y, z, vx, vy, vz, ax, ay, az, mass;
+
+    void add_body(double m, double px, double py, double pz,
+                  double pvx, double pvy, double pvz) {
+        mass.push_back(m);
+        x.push_back(px); y.push_back(py); z.push_back(pz);
+        vx.push_back(pvx); vy.push_back(pvy); vz.push_back(pvz);
+    }
+
+    void add_population(std::mt19937& rng, int count,
+                        double mlo, double mhi, double rmin, double rmax) {
+        const double two_pi = 2.0 * std::acos(-1.0);
+        for (int k = 0; k < count; ++k) {
+            const double m = random_log(rng, mlo, mhi);
+            const double r = rmin + random_unit(rng) * (rmax - rmin);
+            const double angle = random_unit(rng) * two_pi;
+            const double v = circular_speed(mass[0], r);
+            add_body(m, r * std::cos(angle), r * std::sin(angle), 0.0,
+                     -v * std::sin(angle), v * std::cos(angle), 0.0);
+        }
+    }
+
+public:
+    explicit System(int num_bodies) : n(num_bodies) {
+        if (n < 1) throw std::invalid_argument("num_bodies must be at least 1");
+
+        x.reserve(n); y.reserve(n); z.reserve(n);
+        vx.reserve(n); vy.reserve(n); vz.reserve(n); mass.reserve(n);
+        ax.resize(n); ay.resize(n); az.resize(n);
+
+        add_body(SUN_MASS, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+
+        // Fixed seed means every benchmark starts from the same initial system.
+        std::mt19937 rng(0);
+        const int nplanets = std::min(
+            n - 1, std::uniform_int_distribution<int>(5, 20)(rng));
+        add_population(rng, nplanets, 3.3e23, 1.9e27, 0.4 * AU, 30.0 * AU);
+
+        const int asteroids = n - 1 - nplanets;
+        if (asteroids > 0)
+            add_population(rng, asteroids, 1.0e15, 1.0e20, 2.1 * AU, 3.3 * AU);
+    }
+
+    void stepForward(double dt) {
+        // Each thread owns different i values, so no two threads write the
+        // same acceleration element. Positions remain unchanged in this pass.
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < n; ++i) {
+            const double xi = x[i], yi = y[i], zi = z[i];
+            double sumx = 0.0, sumy = 0.0, sumz = 0.0;
+            int j = 0;
+
+#ifdef USE_AVX
+            const __m256d xi4 = _mm256_set1_pd(xi);
+            const __m256d yi4 = _mm256_set1_pd(yi);
+            const __m256d zi4 = _mm256_set1_pd(zi);
+            const __m256d g4 = _mm256_set1_pd(G);
+            const __m256i i4 = _mm256_set1_epi64x(i);
+            __m256d sx4 = _mm256_setzero_pd();
+            __m256d sy4 = _mm256_setzero_pd();
+            __m256d sz4 = _mm256_setzero_pd();
+
+            // AVX handles four source bodies per iteration. The self lane is
+            // assigned dist²=1 before division, then its force factor is masked
+            // to zero; this avoids dividing by zero for body i interacting with itself.
+            for (; j + 3 < n; j += 4) {
+                const __m256i js = _mm256_set_epi64x(j + 3, j + 2, j + 1, j);
+                const __m256d self = _mm256_castsi256_pd(_mm256_cmpeq_epi64(i4, js));
+
+                __m256d dx = _mm256_sub_pd(_mm256_loadu_pd(x.data() + j), xi4);
+                __m256d dy = _mm256_sub_pd(_mm256_loadu_pd(y.data() + j), yi4);
+                __m256d dz = _mm256_sub_pd(_mm256_loadu_pd(z.data() + j), zi4);
+                const __m256d mj = _mm256_loadu_pd(mass.data() + j);
+
+                __m256d d2 = _mm256_add_pd(
+                    _mm256_add_pd(_mm256_mul_pd(dx, dx), _mm256_mul_pd(dy, dy)),
+                    _mm256_mul_pd(dz, dz));
+                // Replace only the self-interaction distance with 1.0.
+                d2 = _mm256_blendv_pd(d2, _mm256_set1_pd(1.0), self);
+
+                const __m256d invr = _mm256_div_pd(
+                    _mm256_set1_pd(1.0), _mm256_sqrt_pd(d2));
+                const __m256d invr3 = _mm256_mul_pd(_mm256_mul_pd(invr, invr), invr);
+                __m256d factor = _mm256_mul_pd(_mm256_mul_pd(g4, mj), invr3);
+                factor = _mm256_andnot_pd(self, factor);
+
+                sx4 = _mm256_add_pd(sx4, _mm256_mul_pd(dx, factor));
+                sy4 = _mm256_add_pd(sy4, _mm256_mul_pd(dy, factor));
+                sz4 = _mm256_add_pd(sz4, _mm256_mul_pd(dz, factor));
+            }
+
+            alignas(32) double tx[4], ty[4], tz[4];
+            _mm256_store_pd(tx, sx4);
+            _mm256_store_pd(ty, sy4);
+            _mm256_store_pd(tz, sz4);
+            sumx = tx[0] + tx[1] + tx[2] + tx[3];
+            sumy = ty[0] + ty[1] + ty[2] + ty[3];
+            sumz = tz[0] + tz[1] + tz[2] + tz[3];
+#endif
+
+            // Scalar fallback is also the remainder loop when n is not a
+            // multiple of four. Without USE_AVX, it processes every interaction.
+            for (; j < n; ++j) {
+                if (i == j) continue;
+                const double dx = x[j] - xi;
+                const double dy = y[j] - yi;
+                const double dz = z[j] - zi;
+                const double d2 = dx * dx + dy * dy + dz * dz;
+                const double invr = 1.0 / std::sqrt(d2);
+                const double factor = G * mass[j] * invr * invr * invr;
+                sumx += dx * factor;
+                sumy += dy * factor;
+                sumz += dz * factor;
+            }
+
+            ax[i] = sumx;
+            ay[i] = sumy;
+            az[i] = sumz;
+        }
+
+        // Separate pass is essential: every acceleration must use the same
+        // old positions, rather than positions already updated by another body.
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < n; ++i) {
+            vx[i] += ax[i] * dt;
+            vy[i] += ay[i] * dt;
+            vz[i] += az[i] * dt;
+            x[i] += vx[i] * dt;
+            y[i] += vy[i] * dt;
+            z[i] += vz[i] * dt;
+        }
+    }
+
+    void print() const {
+        for (int i = 0; i < n; ++i) {
+            std::cout << i << '\t' << mass[i] << '\t'
+                      << x[i] << ',' << y[i] << ',' << z[i] << '\t'
+                      << vx[i] << ',' << vy[i] << ',' << vz[i] << '\n';
+        }
+    }
+};
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <num_bodies> [dt] [num_steps] [output_every]\n"
+                  << "Use output_every=0 to disable output for benchmarking.\n";
+        return 1;
+    }
+
+    try {
+        const int n = std::stoi(argv[1]);
+        const double dt = argc > 2 ? std::stod(argv[2]) : 10.0;
+        const int steps = argc > 3 ? std::stoi(argv[3]) : 100;
+        const int output_every = argc > 4 ? std::stoi(argv[4]) : 0;
+        if (steps < 0 || output_every < 0)
+            throw std::invalid_argument("steps and output_every must be non-negative");
+
+        System system(n);
+        const double start = omp_get_wtime();
+
+        for (int t = 0; t < steps; ++t) {
+            system.stepForward(dt);
+            if (output_every > 0 && t % output_every == 0)
+                system.print();
+        }
+
+        std::cerr << "Elapsed time: " << (omp_get_wtime() - start) << " seconds\n";
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+/*
+    The compiles code compiled to Elapsed time: 4.25536 seconds for 
+    ./solar_sim_fast 10000 > /dev/null
+    Before the optimization, the code took 10.289 seconds to run for
+    ./solar_sim_fast 5000 > /dev/null
+*/
